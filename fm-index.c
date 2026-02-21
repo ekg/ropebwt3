@@ -2,6 +2,7 @@
 #include <assert.h>
 #include "rb3priv.h"
 #include "fm-index.h"
+#include "move.h"
 #include "rle.h"
 #include "kthread.h"
 #include "kalloc.h"
@@ -300,6 +301,42 @@ void rb3_fmi_merge_plain(mrope_t *r, int64_t len, const uint8_t *seq, int n_thre
 	if (rb3_verbose >= 3)
 		fprintf(stderr, "[M::%s::%.3f*%.2f] inserted %ld symbols\n", __func__, rb3_realtime(), rb3_percent_cpu(), (long)acb[RB3_ASIZE]);
 	free(rb);
+}
+
+/*****************************
+ * Move-based rank dispatch  *
+ *****************************/
+
+/*
+ * Rank dispatch via b-move: compute rank arrays at positions k and l.
+ * Uses the precomputed cumulative rank table for O(log r) rank queries.
+ */
+void rb3_fmi_rank2a_mv(const rb3_bmove_t *bm, int64_t k, int64_t l, int64_t *ok, int64_t *ol)
+{
+	rb3_bmove_rank2a(bm, k, l, ok, ol);
+}
+
+/*
+ * Rank dispatch via b-move: compute rank array at position k, return BWT[k].
+ * Uses the precomputed cumulative rank table.
+ */
+int rb3_fmi_rank1a_mv(const rb3_bmove_t *bm, int64_t k, int64_t *ok)
+{
+	const rb3_move_t *m = bm->mv;
+	int64_t run;
+	rb3_bmove_rank1a(bm, k, ok);
+	if (k < 0 || k >= m->bwt_len) return 0;
+	/* Determine the BWT character at position k via binary search */
+	{
+		int64_t lo = 0, hi = m->n_runs - 1;
+		while (lo < hi) {
+			int64_t mid = lo + (hi - lo + 1) / 2;
+			if (m->rows[mid].p <= k) lo = mid;
+			else hi = mid - 1;
+		}
+		run = lo;
+	}
+	return m->rows[run].c;
 }
 
 /***************
@@ -622,6 +659,24 @@ int rb3_fmi_load_all(rb3_fmi_t *f, const char *fn, int32_t load_flag)
 				fprintf(stderr, "[M::%s::%.3f*%.2f] loaded the sampled suffix array\n", __func__, rb3_realtime(), rb3_percent_cpu());
 		}
 	}
+	if (load_flag & RB3_LOAD_SSA) {
+		strcat(strcpy(buf, fn), ".sri");
+		if ((fp = fopen(buf, "r")) != 0) {
+			fclose(fp);
+			f->srindex = rb3_srindex_restore(buf);
+			if (f->srindex == 0) {
+				if (rb3_verbose >= 1)
+					fprintf(stderr, "ERROR: failed to load SR-index from file \"%s\"\n", buf);
+			} else if (f->srindex->m != f->acc[1]) {
+				if (rb3_verbose >= 1)
+					fprintf(stderr, "ERROR: number of sequences do not match between BWT and SR-index\n");
+				rb3_srindex_destroy(f->srindex);
+				f->srindex = 0;
+			}
+			if (f->srindex && rb3_verbose >= 3)
+				fprintf(stderr, "[M::%s::%.3f*%.2f] loaded the SR-index\n", __func__, rb3_realtime(), rb3_percent_cpu());
+		}
+	}
 	if ((load_flag & RB3_LOAD_SSA) && (load_flag & RB3_LOAD_SID)) {
 		strcat(strcpy(buf, fn), ".len.gz");
 		if ((fp = fopen(buf, "r")) != 0) {
@@ -639,6 +694,29 @@ int rb3_fmi_load_all(rb3_fmi_t *f, const char *fn, int32_t load_flag)
 			if (rb3_verbose >= 3)
 				fprintf(stderr, "[M::%s::%.3f*%.2f] loaded the sequence names and lengths\n", __func__, rb3_realtime(), rb3_percent_cpu());
 		}
+	}
+	/* Auto-detect and load move index (.mvi) if present */
+	strcat(strcpy(buf, fn), ".mvi");
+	if ((fp = fopen(buf, "r")) != 0) {
+		fclose(fp);
+		f->mv = rb3_move_load(buf);
+		if (f->mv == 0) {
+			if (rb3_verbose >= 1)
+				fprintf(stderr, "WARNING: failed to load move index from file \"%s\"\n", buf);
+		} else if (f->mv->bwt_len != f->acc[RB3_ASIZE]) {
+			if (rb3_verbose >= 1)
+				fprintf(stderr, "WARNING: BWT length mismatch between index and move file \"%s\"\n", buf);
+			rb3_move_destroy(f->mv);
+			f->mv = 0;
+		}
+		if (f->mv && rb3_verbose >= 3)
+			fprintf(stderr, "[M::%s::%.3f*%.2f] loaded the move index (%ld runs)\n", __func__, rb3_realtime(), rb3_percent_cpu(), (long)f->mv->n_runs);
+	}
+	/* Build b-move for rank dispatch if move index is available */
+	if (f->mv) {
+		f->bm = rb3_bmove_init(f->mv);
+		if (f->bm && rb3_verbose >= 3)
+			fprintf(stderr, "[M::%s::%.3f*%.2f] built b-move for rank dispatch\n", __func__, rb3_realtime(), rb3_percent_cpu());
 	}
 	free(buf);
 	return 0;

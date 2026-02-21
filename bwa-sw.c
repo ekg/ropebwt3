@@ -544,14 +544,17 @@ void rb3_sw(void *km, const rb3_swopt_t *opt, const rb3_fmi_t *f, int len, const
 		g = rb3_dawg_gen(km, q);
 	}
 	sw_core(km, opt, f, g, seq, rst, 0);
-	if (f->ssa) {
+	if (f->srindex || f->ssa) {
 		int64_t rest = opt->max_pos;
 		int32_t k;
 		for (k = 0; k < rst->n; ++k) {
 			rb3_swhit_t *hit = &rst->a[k];
 			int32_t n = rest > 0? rest : 1;
 			hit->pos = RB3_CALLOC(rb3_pos_t, n);
-			hit->n_pos = rb3_ssa_multi(km, f, f->ssa, hit->lo, hit->hi, n, hit->pos);
+			if (f->srindex)
+				hit->n_pos = rb3_srindex_multi(km, f, f->srindex, hit->lo, hit->hi, n, hit->pos);
+			else
+				hit->n_pos = rb3_ssa_multi(km, f, f->ssa, hit->lo, hit->hi, n, hit->pos);
 			rest -= hit->n_pos;
 		}
 	}

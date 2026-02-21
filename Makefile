@@ -3,7 +3,7 @@ CFLAGS=		-g -Wall -Wc++-compat -O3
 CPPFLAGS=
 INCLUDES=
 OBJS=		libsais.o libsais64.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o \
-			dawg.o fm-index.o ssa.o sais-ss.o build.o search.o bwa-sw.o
+			dawg.o fm-index.o ssa.o lcp.o srindex.o sais-ss.o build.o search.o bwa-sw.o move.o
 PROG=		ropebwt3
 LIBS=		-lpthread -lz -lm
 
@@ -27,6 +27,21 @@ endif
 all:$(PROG)
 
 ropebwt3:$(OBJS) main.o
+		$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
+
+test-move:test-move.o $(OBJS)
+		$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
+
+test-srindex:test-srindex.o $(OBJS)
+		$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
+
+test-lcp-threshold:test-lcp-threshold.o $(OBJS)
+		$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
+
+test-move-ms:test-move-ms.o $(OBJS)
+		$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
+
+test-ms:test-ms.o $(OBJS)
 		$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
 
 rld0.o:rld0.c rld0.h bre.h
@@ -53,14 +68,20 @@ kalloc.o: kalloc.h
 kthread.o: kthread.h
 libsais.o: libsais.h
 libsais64.o: libsais.h libsais64.h
-main.o: rb3priv.h fm-index.h rld0.h mrope.h rope.h io.h ketopt.h
+main.o: rb3priv.h fm-index.h rld0.h mrope.h rope.h io.h move.h ketopt.h
 misc.o: rb3priv.h
 mrope.o: mrope.h rope.h rle.h
 rld0.o: rld0.h
 rle.o: rle.h
 rope.o: rle.h rope.h
 sais-ss.o: rb3priv.h libsais.h libsais64.h
-search.o: fm-index.h rb3priv.h rld0.h mrope.h rope.h io.h align.h ketopt.h
+search.o: fm-index.h rb3priv.h rld0.h mrope.h rope.h io.h align.h move.h ketopt.h
 search.o: kthread.h kalloc.h
 ssa.o: rb3priv.h fm-index.h rld0.h mrope.h rope.h io.h kalloc.h kthread.h
 ssa.o: ketopt.h ksort.h
+lcp.o: lcp.c lcp.h rb3priv.h fm-index.h rld0.h mrope.h rope.h io.h ketopt.h
+srindex.o: srindex.c srindex.h rb3priv.h fm-index.h rld0.h mrope.h rope.h rle.h kthread.h
+move.o: move.c move.h rb3priv.h fm-index.h rld0.h mrope.h rope.h rle.h kalloc.h
+test-move.o: test-move.c move.h rb3priv.h fm-index.h rld0.h mrope.h rope.h
+test-move-ms.o: test-move-ms.c move.h lcp.h rb3priv.h fm-index.h rld0.h mrope.h rope.h
+test-ms.o: test-ms.c lcp.h rb3priv.h fm-index.h rld0.h mrope.h rope.h io.h

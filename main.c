@@ -3,6 +3,8 @@
 #include "rb3priv.h"
 #include "fm-index.h"
 #include "io.h"
+#include "move.h"
+#include "lcp.h"
 #include "ketopt.h"
 
 #define RB3_VERSION "3.10-r281"
@@ -17,7 +19,11 @@ int main_kount(int argc, char *argv[]);
 int main_fa2line(int argc, char *argv[]);
 int main_fa2kmer(int argc, char *argv[]);
 int main_plain2fmd(int argc, char *argv[]);
+int main_lcp(int argc, char *argv[]);
+int main_move(int argc, char *argv[]);
+int main_srindex(int argc, char *argv[]);
 int main_stat(int argc, char *argv[]);
+static int main_ms(int argc, char *argv[]);
 
 static int usage(FILE *fp)
 {
@@ -27,14 +33,17 @@ static int usage(FILE *fp)
 	fprintf(fp, "    sw         find local alignment\n");
 	fprintf(fp, "    mem        find maximal exact matches\n");
 	fprintf(fp, "    hapdiv     haplotype diversity with sliding k-mers\n");
+	fprintf(fp, "    ms         compute matching statistics\n");
 	fprintf(fp, "    suffix     find the longest matching suffix\n");
 	fprintf(fp, "  Construction:\n");
 	fprintf(fp, "    build      construct a BWT\n");
 	fprintf(fp, "    merge      merge BWTs\n");
 	fprintf(fp, "    plain2fmd  convert BWT in plain text to FMD\n");
 	fprintf(fp, "    ssa        generate sampled suffix array\n");
+	fprintf(fp, "    srindex    generate SR-index (subsampled r-index)\n");
 	fprintf(fp, "  Miscellaneous:\n");
 	fprintf(fp, "    get        retrieve the i-th sequence from BWT\n");
+	fprintf(fp, "    move       build or load move index\n");
 	fprintf(fp, "    stat       basic statistics of BWT\n");
 	fprintf(fp, "    kount      count (high-occurrence) k-mers\n");
 	fprintf(fp, "    fa2line    convert FASTX to lines\n");
@@ -55,6 +64,10 @@ int main(int argc, char *argv[])
 	else if (strcmp(argv[1], "build") == 0) ret = main_build(argc-1, argv+1);
 	else if (strcmp(argv[1], "merge") == 0) ret = main_merge(argc-1, argv+1);
 	else if (strcmp(argv[1], "ssa") == 0) ret = main_ssa(argc-1, argv+1);
+	else if (strcmp(argv[1], "lcp") == 0) ret = main_lcp(argc-1, argv+1);
+	else if (strcmp(argv[1], "srindex") == 0) ret = main_srindex(argc-1, argv+1);
+	else if (strcmp(argv[1], "move") == 0) ret = main_move(argc-1, argv+1);
+	else if (strcmp(argv[1], "ms") == 0) ret = main_ms(argc-1, argv+1);
 	else if (strcmp(argv[1], "stat") == 0) ret = main_stat(argc-1, argv+1);
 	else if (strcmp(argv[1], "suffix") == 0) ret = main_suffix(argc-1, argv+1);
 	else if (strcmp(argv[1], "get") == 0) ret = main_get(argc-1, argv+1);
@@ -422,6 +435,68 @@ int main_kount(int argc, char *argv[])
 	return 0;
 }
 
+int main_move(int argc, char *argv[])
+{
+	int32_t c, d = 0, load_only = 0;
+	ketopt_t o = KETOPT_INIT;
+
+	while ((c = ketopt(&o, argc, argv, 1, "d:l", 0)) >= 0) {
+		if (c == 'd') d = atoi(o.arg);
+		else if (c == 'l') load_only = 1;
+	}
+
+	if (load_only) {
+		rb3_move_t *m;
+		if (argc - o.ind < 1) {
+			fprintf(stderr, "Usage: ropebwt3 move -l <input.mvi>\n");
+			return 1;
+		}
+		m = rb3_move_load(argv[o.ind]);
+		if (m == 0) {
+			fprintf(stderr, "ERROR: failed to load move index '%s'\n", argv[o.ind]);
+			return 1;
+		}
+		fprintf(stderr, "[M::%s] Loaded move index: %ld runs, %ld symbols, d=%d\n",
+			__func__, (long)m->n_runs, (long)m->bwt_len, m->d);
+		rb3_move_destroy(m);
+		return 0;
+	}
+
+	/* Convert FMD/FMR to MVI */
+	{
+		rb3_fmi_t fmi;
+		rb3_move_t *m;
+		if (argc - o.ind < 2) {
+			fprintf(stderr, "Usage: ropebwt3 move [options] <input.fmd> <output.mvi>\n");
+			fprintf(stderr, "       ropebwt3 move -l <input.mvi>\n");
+			fprintf(stderr, "Options:\n");
+			fprintf(stderr, "  -d INT     split depth [0, no splitting]\n");
+			fprintf(stderr, "  -l         load and verify mode\n");
+			return 1;
+		}
+		rb3_fmi_restore(&fmi, argv[o.ind], 0);
+		if (fmi.e == 0 && fmi.r == 0) {
+			fprintf(stderr, "ERROR: failed to load index '%s'\n", argv[o.ind]);
+			return 1;
+		}
+		m = rb3_move_build(&fmi);
+		if (d > 0) rb3_move_split(m, d);
+		rb3_move_precompute_dist(m);
+		if (rb3_move_save(m, argv[o.ind + 1]) != 0) {
+			fprintf(stderr, "ERROR: failed to save move index to '%s'\n", argv[o.ind + 1]);
+			rb3_move_destroy(m);
+			rb3_fmi_free(&fmi);
+			return 1;
+		}
+		if (rb3_verbose >= 3)
+			fprintf(stderr, "[M::%s] Saved move index: %ld runs, %ld symbols, d=%d\n",
+				__func__, (long)m->n_runs, (long)m->bwt_len, m->d);
+		rb3_move_destroy(m);
+		rb3_fmi_free(&fmi);
+	}
+	return 0;
+}
+
 int main_stat(int argc, char *argv[])
 {
 	int32_t c, use_mmap = 0;
@@ -447,6 +522,111 @@ int main_stat(int argc, char *argv[])
 	printf("%ld G\n", (long)(fmi.acc[4] - fmi.acc[3]));
 	printf("%ld T\n", (long)(fmi.acc[5] - fmi.acc[4]));
 	printf("%ld N\n", (long)(fmi.acc[6] - fmi.acc[5]));
+	rb3_fmi_free(&fmi);
+	return 0;
+}
+
+int main_ms(int argc, char *argv[])
+{
+	int32_t c, classify = 0, is_line = 0, j, split_d = 0, use_pml = 0, fmi_only = 0;
+	int64_t min_match = 20;
+	double min_fraction = 0.5;
+	ketopt_t o = KETOPT_INIT;
+	rb3_fmi_t fmi;
+	rb3_move_t *m = 0;
+	rb3_lcp_t *lcp;
+
+	while ((c = ketopt(&o, argc, argv, 1, "pcFLl:f:d:", 0)) >= 0) {
+		if (c == 'p') use_pml = 1;
+		else if (c == 'c') classify = 1;
+		else if (c == 'F') fmi_only = 1;
+		else if (c == 'L') is_line = 1;
+		else if (c == 'l') min_match = atol(o.arg);
+		else if (c == 'f') min_fraction = atof(o.arg);
+		else if (c == 'd') split_d = atoi(o.arg);
+	}
+
+	if (argc - o.ind < 2) {
+		fprintf(stderr, "Usage: ropebwt3 ms [options] <idx.fmd> <seq.fa> [...]\n");
+		fprintf(stderr, "Options:\n");
+		fprintf(stderr, "  -p         compute pseudo-matching lengths (PML) instead of exact MS\n");
+		fprintf(stderr, "  -c         classification mode (SPUMONI-style)\n");
+		fprintf(stderr, "  -F         use FM-index only (no move structure)\n");
+		fprintf(stderr, "  -l INT     min match length for classification [%ld]\n", (long)min_match);
+		fprintf(stderr, "  -f FLOAT   min fraction of positions for classification [%.2f]\n", min_fraction);
+		fprintf(stderr, "  -d INT     move structure split depth [%d]\n", split_d);
+		fprintf(stderr, "  -L         one sequence per line in the input\n");
+		return 1;
+	}
+
+	/* Load FM-index */
+	rb3_fmi_restore(&fmi, argv[o.ind], 0);
+	if (fmi.e == 0 && fmi.r == 0) {
+		fprintf(stderr, "[E::%s] failed to load FM-index '%s'\n", __func__, argv[o.ind]);
+		return 1;
+	}
+
+	/* Build move table (unless FMI-only mode) */
+	if (!fmi_only && !use_pml) {
+		m = rb3_move_build(&fmi);
+		if (split_d > 0) rb3_move_split(m, split_d);
+		rb3_move_precompute_dist(m);
+		if (rb3_verbose >= 3)
+			fprintf(stderr, "[M::%s] built move table: %ld runs\n", __func__, (long)m->n_runs);
+	}
+
+	/* Build LCP + thresholds */
+	lcp = rb3_lcp_build(&fmi);
+	if (lcp == 0) {
+		fprintf(stderr, "[E::%s] failed to build LCP\n", __func__);
+		if (m) rb3_move_destroy(m);
+		rb3_fmi_free(&fmi);
+		return 1;
+	}
+	rb3_lcp_build_thresholds(lcp);
+	if (rb3_verbose >= 3)
+		fprintf(stderr, "[M::%s] built LCP thresholds: %ld runs\n", __func__, (long)lcp->n_runs);
+
+	/* Process query sequences */
+	for (j = o.ind + 1; j < argc; ++j) {
+		rb3_seqio_t *fp;
+		const char *name;
+		char *seq;
+		int64_t len;
+		fp = rb3_seq_open(argv[j], is_line);
+		if (fp == 0) {
+			fprintf(stderr, "[E::%s] failed to open '%s'\n", __func__, argv[j]);
+			continue;
+		}
+		while ((seq = rb3_seq_read1(fp, &len, &name)) != 0) {
+			int64_t *ms, i;
+			rb3_char2nt6(len, (uint8_t *)seq);
+			ms = RB3_MALLOC(int64_t, len);
+			if (use_pml)
+				rb3_pml_compute(&fmi, lcp, (const uint8_t *)seq, len, ms);
+			else if (m)
+				rb3_move_ms_compute(m, lcp, len, (const uint8_t *)seq, ms);
+			else
+				rb3_ms_compute(&fmi, lcp, (const uint8_t *)seq, len, ms);
+			if (classify) {
+				int64_t count = 0;
+				for (i = 0; i < len; ++i)
+					if (ms[i] >= min_match) ++count;
+				printf("%s\t%ld\t%s\n",
+				       name ? name : "seq", (long)len,
+				       (double)count / len >= min_fraction ? "Y" : "N");
+			} else {
+				printf(">%s\n", name ? name : "seq");
+				for (i = 0; i < len; ++i)
+					printf("%ld%c", (long)ms[i], i + 1 < len ? ' ' : '\n');
+			}
+			free(ms);
+		}
+		rb3_seq_close(fp);
+	}
+
+	if (m) rb3_move_destroy(m);
+	rb3_lcp_destroy(lcp);
 	rb3_fmi_free(&fmi);
 	return 0;
 }

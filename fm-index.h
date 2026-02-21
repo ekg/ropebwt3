@@ -7,12 +7,19 @@
 #include "rld0.h"
 #include "mrope.h"
 #include "io.h"
+#include "srindex.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define RB3_ASIZE 6
+
+struct rb3_move_s; /* forward declaration for optional move backend */
+struct rb3_bmove_s; /* forward declaration for optional b-move rank backend */
+void rb3_move_destroy(struct rb3_move_s *m);
+struct rb3_move_s *rb3_move_load(const char *fn);
+void rb3_bmove_destroy(struct rb3_bmove_s *bm);
 
 typedef enum { RB3_PLAIN, RB3_FMD, RB3_FMR, RB3_TREE, RB3_BRE } rb3_fmt_t;
 
@@ -44,7 +51,10 @@ typedef struct {
 	rld_t *e;
 	mrope_t *r;
 	rb3_ssa_t *ssa;
+	rb3_srindex_t *srindex;
 	rb3_sid_t *sid;
+	struct rb3_move_s *mv;
+	struct rb3_bmove_s *bm; /* b-move for O(log r) rank dispatch; NULL if not available */
 	int64_t acc[RB3_ASIZE+1];
 } rb3_fmi_t;
 
@@ -59,6 +69,10 @@ void *rb3_r2cache_init(void *km, int32_t max);
 void rb3_r2cache_destroy(void *rc_);
 void rb3_fmi_rank2a_cached(const rb3_fmi_t *fmi, void *rc_, int64_t k, int64_t l, int64_t ok[6], int64_t ol[6]);
 void rb3_fmd_extend_cached(const rb3_fmi_t *f, void *rc, const rb3_sai_t *ik, rb3_sai_t ok[RB3_ASIZE], int is_back);
+
+/* Rank dispatch via b-move (defined in fm-index.c, requires move.h at link time) */
+void rb3_fmi_rank2a_mv(const struct rb3_bmove_s *bm, int64_t k, int64_t l, int64_t *ok, int64_t *ol);
+int rb3_fmi_rank1a_mv(const struct rb3_bmove_s *bm, int64_t k, int64_t *ok);
 
 void rb3_mg_rank(const rb3_fmi_t *fa, const rb3_fmi_t *fb, int64_t *rb, int n_threads);
 void rb3_mg_rank_plain(const rb3_fmi_t *fa, int64_t len, const uint8_t *seq, int64_t *rb, int64_t acc[RB3_ASIZE+1], int n_threads);
@@ -80,6 +94,8 @@ int rb3_ssa_dump(const rb3_ssa_t *sa, const char *fn);
 rb3_ssa_t *rb3_ssa_restore(const char *fn);
 rb3_ssa_t *rb3_ssa_gen(const rb3_fmi_t *f, int ssa_shift, int n_threads);
 
+int64_t rb3_srindex_multi(void *km, const rb3_fmi_t *f, const rb3_srindex_t *sr, int64_t lo, int64_t hi, int64_t max_pos, rb3_pos_t *pos);
+
 int rb3_fmi_load_all(rb3_fmi_t *f, const char *fn, int32_t load_flag);
 
 static inline int rb3_comp(int c)
@@ -97,17 +113,22 @@ static inline void rb3_fmi_init(rb3_fmi_t *f, rld_t *e, mrope_t *r)
 	if (e) f->is_fmd = 1, f->e = e, f->r = 0;
 	else f->is_fmd = 0, f->e = 0, f->r = r;
 	f->ssa = 0;
+	f->srindex = 0;
+	f->mv = 0;
+	f->bm = 0;
 	rb3_fmi_get_acc(f, f->acc);
 }
 
 static inline void rb3_fmi_rank2a(const rb3_fmi_t *fmi, int64_t k, int64_t l, int64_t *ok, int64_t *ol)
 {
-	if (fmi->is_fmd) rld_rank2a(fmi->e, k, l, (uint64_t*)ok, (uint64_t*)ol);
+	if (fmi->bm) rb3_fmi_rank2a_mv(fmi->bm, k, l, ok, ol);
+	else if (fmi->is_fmd) rld_rank2a(fmi->e, k, l, (uint64_t*)ok, (uint64_t*)ol);
 	else mr_rank2a(fmi->r, k, l, ok, ol);
 }
 
 static inline int rb3_fmi_rank1a(const rb3_fmi_t *fmi, int64_t k, int64_t *ok)
 {
+	if (fmi->bm) return rb3_fmi_rank1a_mv(fmi->bm, k, ok);
 	return fmi->is_fmd? rld_rank1a(fmi->e, k, (uint64_t*)ok) : mr_rank1a(fmi->r, k, ok);
 }
 
@@ -116,13 +137,16 @@ static inline void rb3_fmi_free(rb3_fmi_t *fmi)
 	if (fmi->is_fmd) rld_destroy(fmi->e);
 	else mr_destroy(fmi->r);
 	if (fmi->ssa) rb3_ssa_destroy(fmi->ssa);
+	if (fmi->srindex) rb3_srindex_destroy(fmi->srindex);
 	if (fmi->sid) rb3_sid_destroy(fmi->sid);
-	fmi->e = 0, fmi->r = 0, fmi->ssa = 0;
+	if (fmi->bm) rb3_bmove_destroy(fmi->bm);
+	if (fmi->mv) rb3_move_destroy(fmi->mv);
+	fmi->e = 0, fmi->r = 0, fmi->ssa = 0, fmi->srindex = 0, fmi->mv = 0, fmi->bm = 0;
 }
 
 static inline void rb3_fmi_restore(rb3_fmi_t *fmi, const char *fn, int use_mmap)
 {
-	fmi->r = 0, fmi->e = 0, fmi->ssa = 0, fmi->sid = 0;
+	fmi->r = 0, fmi->e = 0, fmi->ssa = 0, fmi->srindex = 0, fmi->sid = 0, fmi->mv = 0, fmi->bm = 0;
 	fmi->e = use_mmap? rld_restore_mmap(fn) : rld_restore(fn);
 	if (fmi->e == 0) {
 		fmi->r = mr_restore_file(fn);

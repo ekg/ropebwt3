@@ -2,6 +2,7 @@
 #include "align.h"
 #include "rb3priv.h"
 #include "io.h"
+#include "move.h"
 #include "ketopt.h"
 #include "kthread.h"
 #include "kalloc.h"
@@ -99,10 +100,17 @@ static void worker_for_seq(void *data, long i, int tid)
 	} else { // MEM algorithms
 		int32_t i;
 		b->mem.n = 0;
-		if (p->opt->algo == RB3_SA_MEM_TG)
-			rb3_fmd_smem_TG(b->km, &p->fmi, s->len, s->seq, &b->mem, p->opt->min_occ, p->opt->min_len);
-		else if (p->opt->algo == RB3_SA_MEM_ORI)
-			rb3_fmd_smem(b->km, &p->fmi, s->len, s->seq, &b->mem, p->opt->min_occ, p->opt->min_len);
+		if (p->opt->algo == RB3_SA_MEM_TG) {
+			if (p->fmi.bm)
+				rb3_bmove_smem_TG(b->km, (const rb3_bmove_t *)p->fmi.bm, s->len, s->seq, &b->mem, p->opt->min_occ, p->opt->min_len);
+			else
+				rb3_fmd_smem_TG(b->km, &p->fmi, s->len, s->seq, &b->mem, p->opt->min_occ, p->opt->min_len);
+		} else if (p->opt->algo == RB3_SA_MEM_ORI) {
+			if (p->fmi.bm)
+				rb3_bmove_smem(b->km, (const rb3_bmove_t *)p->fmi.bm, s->len, s->seq, &b->mem, p->opt->min_occ, p->opt->min_len);
+			else
+				rb3_fmd_smem(b->km, &p->fmi, s->len, s->seq, &b->mem, p->opt->min_occ, p->opt->min_len);
+		}
 		s->n_mem = b->mem.n;
 		s->mem = RB3_CALLOC(m_sai_pos_t, s->n_mem);
 		for (i = 0; i < s->n_mem; ++i)
@@ -125,26 +133,18 @@ static void worker_for_seq(void *data, long i, int tid)
 			s->gap = RB3_MALLOC(uint64_t, s->n_gap);
 			memcpy(s->gap, b->gap, s->n_gap * 8);
 		} else if (p->opt->max_pos > 0) {
-			#if 1 // faster algorithm
 			rb3_pos_t *pos;
 			pos = Kmalloc(b->km, rb3_pos_t, p->opt->max_pos);
 			for (i = 0; i < s->n_mem; ++i) {
 				m_sai_pos_t *q = &s->mem[i];
-				q->n_pos = rb3_ssa_multi(b->km, &p->fmi, p->fmi.ssa, q->mem.x[0], q->mem.x[0] + q->mem.size, p->opt->max_pos, pos);
+				if (p->fmi.srindex)
+					q->n_pos = rb3_srindex_multi(b->km, &p->fmi, p->fmi.srindex, q->mem.x[0], q->mem.x[0] + q->mem.size, p->opt->max_pos, pos);
+				else
+					q->n_pos = rb3_ssa_multi(b->km, &p->fmi, p->fmi.ssa, q->mem.x[0], q->mem.x[0] + q->mem.size, p->opt->max_pos, pos);
 				q->pos = RB3_MALLOC(rb3_pos_t, q->n_pos);
 				memcpy(q->pos, pos, sizeof(rb3_pos_t) * q->n_pos);
 			}
 			kfree(b->km, pos);
-			#else // naive algorithm
-			for (i = 0; i < s->n_mem; ++i) {
-				m_sai_pos_t *q = &s->mem[i];
-				int32_t j;
-				q->n_pos = q->mem.size < p->opt->max_pos? q->mem.size : p->opt->max_pos;
-				q->pos = RB3_MALLOC(rb3_pos_t, q->n_pos);
-				for (j = 0; j < q->n_pos; ++j)
-					q->pos[j].pos = rb3_ssa(&p->fmi, p->fmi.ssa, q->mem.x[0] + j, &q->pos[j].sid);
-			}
-			#endif
 		}
 	}
 }
@@ -552,9 +552,14 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 
 	ret = rb3_fmi_load_all(&p.fmi, argv[o.ind], load_flag);
 	if (ret < 0) return 1;
-	if (opt.max_pos > 0 && (p.fmi.ssa == 0 || p.fmi.sid == 0)) {
+	if (opt.max_pos > 0 && (p.fmi.ssa == 0 && p.fmi.srindex == 0)) {
 		if (rb3_verbose >= 1)
-			fprintf(stderr, "ERROR: failed to load suffix array samples or sequence names/lengths\n");
+			fprintf(stderr, "ERROR: failed to load suffix array samples or SR-index\n");
+		return 1;
+	}
+	if (opt.max_pos > 0 && p.fmi.sid == 0) {
+		if (rb3_verbose >= 1)
+			fprintf(stderr, "ERROR: failed to load sequence names/lengths\n");
 		return 1;
 	}
 	if (!rb3_fmi_is_symmetric(&p.fmi)) {
@@ -562,6 +567,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "ERROR: BWT doesn't contain both strands\n");
 		return 1;
 	}
+	/* b-move for SMEM is now auto-built in rb3_fmi_load_all via fmi.bm */
 	if (opt.flag & RB3_MF_WRITE_ALL) {
 		puts("CC\tQS  queryName  queryLen  numHap");
 		puts("CC\tQH  refCount   score     editDist   cs   strand   nOut   totAln");
