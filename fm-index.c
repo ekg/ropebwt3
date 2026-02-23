@@ -326,17 +326,17 @@ int rb3_fmi_rank1a_mv(const rb3_bmove_t *bm, int64_t k, int64_t *ok)
 	int64_t run;
 	rb3_bmove_rank1a(bm, k, ok);
 	if (k < 0 || k >= m->bwt_len) return 0;
-	/* Determine the BWT character at position k via binary search */
+	/* Determine the BWT character at position k via binary search on p[] */
 	{
 		int64_t lo = 0, hi = m->n_runs - 1;
 		while (lo < hi) {
 			int64_t mid = lo + (hi - lo + 1) / 2;
-			if (m->rows[mid].p <= k) lo = mid;
+			if (m->p[mid] <= k) lo = mid;
 			else hi = mid - 1;
 		}
 		run = lo;
 	}
-	return m->rows[run].c;
+	return m->c[run];
 }
 
 /***************

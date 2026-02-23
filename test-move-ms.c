@@ -494,14 +494,14 @@ static int test_threshold_precompute(void)
 		/* Find the LCP run for this move row's position */
 		int64_t j, lcp_run = 0;
 		for (j = 0; j < lcp->n_runs; ++j) {
-			if (j + 1 < lcp->n_runs && lcp->run_starts[j + 1] <= m->rows[i].p)
+			if (j + 1 < lcp->n_runs && lcp->run_starts[j + 1] <= m->p[i])
 				continue;
 			lcp_run = j;
 			break;
 		}
 		if (th[i] != lcp->thresholds[lcp_run]) {
 			fprintf(stderr, "  FAIL: move row %ld (p=%ld): th=%ld, expected=%ld (lcp run %ld)\n",
-			        (long)i, (long)m->rows[i].p, (long)th[i],
+			        (long)i, (long)m->p[i], (long)th[i],
 			        (long)lcp->thresholds[lcp_run], (long)lcp_run);
 			ret = 1;
 			break;
@@ -679,10 +679,10 @@ static int test_varied_text_debug(void)
 	fprintf(stderr, "  Move rows: %ld\n", (long)m->n_runs);
 	for (i = 0; i < m->n_runs; ++i)
 		fprintf(stderr, "    row[%ld]: c=%d p=%ld len=%ld lcp_run=%ld dist_A=%d dist_C=%d dist_G=%d dist_T=%d\n",
-		        (long)i, m->rows[i].c, (long)m->rows[i].p, (long)m->rows[i].len,
+		        (long)i, m->c[i], (long)m->p[i], (long)m->len[i],
 		        (long)run_map[i],
-		        m->rows[i].dist[1], m->rows[i].dist[2],
-		        m->rows[i].dist[3], m->rows[i].dist[4]);
+		        m->dist[i * RB3_ASIZE + 1], m->dist[i * RB3_ASIZE + 2],
+		        m->dist[i * RB3_ASIZE + 3], m->dist[i * RB3_ASIZE + 4]);
 
 	/* Trace move-based MS step by step */
 	pos = 0; run_idx = 0; match_len = 0;
@@ -692,7 +692,7 @@ static int test_varied_text_debug(void)
 		int64_t old_pos = pos, old_run = run_idx, old_ml = match_len;
 		pos = rb3_move_ms_step(m, run_map, lcp, pos, &run_idx, &match_len, c);
 		fprintf(stderr, "    i=%ld c=%d: pos %ld(run %ld,c=%d) ml=%ld -> pos %ld(run %ld) ml=%ld\n",
-		        (long)i, c, (long)old_pos, (long)old_run, m->rows[old_run].c,
+		        (long)i, c, (long)old_pos, (long)old_run, m->c[old_run],
 		        (long)old_ml, (long)pos, (long)run_idx, (long)match_len);
 	}
 

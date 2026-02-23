@@ -8,25 +8,43 @@
 extern "C" {
 #endif
 
+/* Legacy 48-byte row struct, kept for v1 .mvi backward compat loading */
 typedef struct rb3_move_row_s {
-	int64_t p;       // Starting BWT offset of this run
-	int64_t pi;      // LF[p] — LF-mapping of the run head
-	int64_t xi;      // Index of the destination row containing pi
-	int64_t len;     // Run length
-	int16_t dist[RB3_ASIZE]; // Distance (in rows) to nearest run of each character; 0 = self
-	int8_t c;        // BWT character of this run (0-5)
-	uint8_t pad_[3]; // padding to 48 bytes for mmap alignment
+	int64_t p;
+	int64_t pi;
+	int64_t xi;
+	int64_t len;
+	int16_t dist[RB3_ASIZE];
+	int8_t c;
+	uint8_t pad_[3];
 } rb3_move_row_t;
 
+/*
+ * Move table: separate arrays for cache-friendly access.
+ *
+ * Hot path (rank queries via bmove): binary search on p[], then scan c[]+len[]
+ * to reconstruct sampled cumrank. Working set: p[] (8B/row) + c[] (1B/row) +
+ * len[] (4B/row) + sampled cumrank (~0.75B/row) ≈ 14B/row vs old 96B/row.
+ *
+ * Cold path (LF-mapping, reposition): pi[], xi[], dist[].
+ */
 typedef struct rb3_move_s {
-	int64_t n_runs;          // Number of runs (r)
-	int64_t bwt_len;         // Total BWT length (n)
-	int64_t acc[7];          // Cumulative character counts C[]
-	int32_t d;               // Run-splitting depth (0 = no splitting)
-	rb3_move_row_t *rows;    // Flat array of rows
-	int _fd;                 // file descriptor for mmap (internal)
-	void *_mmap_base;        // mmap base address (internal, NULL if heap-allocated)
-	size_t _mmap_len;        // mmap region length (internal)
+	int64_t n_runs;          /* Number of runs (r) */
+	int64_t bwt_len;         /* Total BWT length (n) */
+	int64_t acc[7];          /* Cumulative character counts C[] */
+	int32_t d;               /* Run-splitting depth (0 = no splitting) */
+
+	/* Separate arrays (always populated) */
+	int64_t *p;              /* p[i]: starting BWT offset of run i */
+	int64_t *pi;             /* pi[i]: LF[p[i]] */
+	uint32_t *xi;            /* xi[i]: destination run index */
+	int64_t *len;            /* len[i]: run length */
+	int8_t *c;               /* c[i]: BWT character (0-5) */
+	int16_t *dist;           /* dist[i*6+j]: reposition distance for char j from run i */
+
+	int _fd;                 /* file descriptor for mmap (internal) */
+	void *_mmap_base;        /* mmap base address (internal, NULL if heap-allocated) */
+	size_t _mmap_len;        /* mmap region length (internal) */
 } rb3_move_t;
 
 // Build move table from FM-index (no splitting)
@@ -60,54 +78,48 @@ int64_t rb3_move_count(const rb3_move_t *m, int len, const uint8_t *pattern);
 struct rb3_lcp_s; /* forward declaration for LCP integration */
 
 // Precompute per-move-row thresholds from LCP thresholds.
-// Maps each move row to its corresponding LCP run threshold via linear scan.
-// Returns malloc'd array of m->n_runs int64_t values. Caller must free().
 int64_t *rb3_move_lcp_thresholds(const rb3_move_t *m, const struct rb3_lcp_s *lcp);
 
 // Map each move row to its LCP run index.
-// Returns malloc'd array of m->n_runs int64_t values. Caller must free().
 int64_t *rb3_move_lcp_run_map(const rb3_move_t *m, const struct rb3_lcp_s *lcp);
 
 // One backward step of matching statistics with move + LCP.
-// pos: current BWT position in run *run_idx, *match_len: current match length.
-// c: query character (nt6, 1-5). run_map: move-row-to-LCP-run mapping from
-// rb3_move_lcp_run_map(). Returns new BWT position; updates *run_idx
-// and *match_len. Returns -1 if c does not exist in the BWT.
 int64_t rb3_move_ms_step(const rb3_move_t *m, const int64_t *run_map,
                          const struct rb3_lcp_s *lcp,
                          int64_t pos, int64_t *run_idx, int64_t *match_len, int8_t c);
 
 // Compute matching statistics for pattern[0..len-1] using move + LCP.
-// pattern is nt6-encoded (1-5). ms[i] = longest prefix of pattern[i..] in T.
-// Returns 0 on success, -1 on error.
 int rb3_move_ms_compute(const rb3_move_t *m, const struct rb3_lcp_s *lcp,
                         int64_t len, const uint8_t *pattern, int64_t *ms);
 
 // Serialization: save move table to .mvi file; returns 0 on success, -1 on error.
 int rb3_move_save(const rb3_move_t *m, const char *fn);
 
-// Deserialization: load move table from .mvi file via memory mapping.
-// Returns NULL on error. The loaded table is read-only (mmap'd).
+// Deserialization: load move table from .mvi file.
+// Supports both v1 (48-byte rows) and v2 (compact) formats.
+// Returns NULL on error.
 rb3_move_t *rb3_move_load(const char *fn);
 
 /*
  * b-move: bidirectional move structure for FMD-style bidirectional search.
  *
- * In the FMD model, both forward and backward extensions use rank queries
- * on the same BWT (exploiting symmetric construction with both strands).
- * The b-move wraps a single move structure with a persistent cumulative
- * rank table, enabling O(log r)-time rank queries at arbitrary BWT positions.
+ * Uses a SAMPLED cumulative rank table (every CUMRANK_SAMPLE rows) to reduce
+ * memory from r*48 bytes to r*48/K bytes. Rank queries reconstruct intermediate
+ * values by scanning K compact rows — sequential, cache-friendly access.
  */
+#define RB3_CUMRANK_SAMPLE 64
+
 typedef struct rb3_bmove_s {
-	const rb3_move_t *mv;  // Move structure (not owned; caller manages lifetime)
-	int64_t *cumrank;      // Cumulative rank table: cumrank[i*6+c] = rank(c, rows[i].p)
+	const rb3_move_t *mv;    /* Move structure (not owned; caller manages lifetime) */
+	int64_t *cumrank;        /* Sampled cumrank: cumrank[(i/K)*6+c] = rank(c, p[i*K]) */
+	int64_t n_samples;       /* Number of samples: n_runs/K + 1 */
 } rb3_bmove_t;
 
 // Build b-move from existing move structure. Does not take ownership of mv.
 rb3_bmove_t *rb3_bmove_init(const rb3_move_t *mv);
 void rb3_bmove_destroy(rb3_bmove_t *bm);
 
-// Rank query: compute rank(c, pos) for all characters c using b-move cumrank table.
+// Rank query: compute rank(c, pos) for all characters c.
 // ok[c] = number of character c in BWT[0..pos).
 void rb3_bmove_rank1a(const rb3_bmove_t *bm, int64_t pos, int64_t ok[RB3_ASIZE]);
 
@@ -115,7 +127,6 @@ void rb3_bmove_rank1a(const rb3_bmove_t *bm, int64_t pos, int64_t ok[RB3_ASIZE])
 void rb3_bmove_rank2a(const rb3_bmove_t *bm, int64_t k, int64_t l, int64_t ok[RB3_ASIZE], int64_t ol[RB3_ASIZE]);
 
 // FMD-style bidirectional extension using b-move.
-// Same semantics as rb3_fmd_extend(): is_back=1 for backward, is_back=0 for forward.
 void rb3_bmove_extend(const rb3_bmove_t *bm, const rb3_sai_t *ik, rb3_sai_t ok[6], int is_back);
 
 // SMEM finding using b-move (original algorithm, same as rb3_fmd_smem).

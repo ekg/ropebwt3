@@ -20,7 +20,7 @@ static int64_t find_run(const rb3_move_t *m, int64_t pos)
 {
 	int64_t i;
 	for (i = 0; i < m->n_runs; i++)
-		if (pos >= m->rows[i].p && pos < m->rows[i].p + m->rows[i].len)
+		if (pos >= m->p[i] && pos < m->p[i] + m->len[i])
 			return i;
 	return -1;
 }
@@ -88,12 +88,11 @@ static int test_basic(void)
 
 	/* Verify each row's fields */
 	for (i = 0; i < n_exp; ++i) {
-		rb3_move_row_t *r = &m->rows[i];
-		if (r->c != exp_c[i] || r->len != exp_len[i] || r->p != exp_p[i] ||
-		    r->pi != exp_pi[i] || r->xi != exp_xi[i]) {
-			fprintf(stderr, "FAIL: row[%d] = (c=%d, len=%ld, p=%ld, pi=%ld, xi=%ld)\n"
+		if (m->c[i] != exp_c[i] || m->len[i] != exp_len[i] || m->p[i] != exp_p[i] ||
+		    m->pi[i] != exp_pi[i] || m->xi[i] != (uint32_t)exp_xi[i]) {
+			fprintf(stderr, "FAIL: row[%d] = (c=%d, len=%ld, p=%ld, pi=%ld, xi=%u)\n"
 				"      expected (c=%d, len=%ld, p=%ld, pi=%ld, xi=%ld)\n",
-				i, r->c, (long)r->len, (long)r->p, (long)r->pi, (long)r->xi,
+				i, m->c[i], (long)m->len[i], (long)m->p[i], (long)m->pi[i], m->xi[i],
 				exp_c[i], (long)exp_len[i], (long)exp_p[i], (long)exp_pi[i], (long)exp_xi[i]);
 			ret = 1; goto done;
 		}
@@ -102,28 +101,28 @@ static int test_basic(void)
 	/* Verify LF-mapping of run heads against rb3_fmi_rank1a */
 	for (i = 0; i < n_exp; ++i) {
 		int64_t ok[RB3_ASIZE];
-		int c_at_p = rb3_fmi_rank1a(&fmi, m->rows[i].p, ok);
+		int c_at_p = rb3_fmi_rank1a(&fmi, m->p[i], ok);
 		int64_t pi_check = fmi.acc[c_at_p] + ok[c_at_p];
-		if (c_at_p != m->rows[i].c) {
+		if (c_at_p != m->c[i]) {
 			fprintf(stderr, "FAIL: rank1a at row[%d].p=%ld returned c=%d, expected %d\n",
-				i, (long)m->rows[i].p, c_at_p, m->rows[i].c);
+				i, (long)m->p[i], c_at_p, m->c[i]);
 			ret = 1; goto done;
 		}
-		if (pi_check != m->rows[i].pi) {
+		if (pi_check != m->pi[i]) {
 			fprintf(stderr, "FAIL: rank1a-based pi for row[%d] = %ld, expected %ld\n",
-				i, (long)pi_check, (long)m->rows[i].pi);
+				i, (long)pi_check, (long)m->pi[i]);
 			ret = 1; goto done;
 		}
 	}
 
-	/* Verify destination indices: pi must fall within the run at rows[xi] */
+	/* Verify destination indices: pi must fall within the run at xi */
 	for (i = 0; i < n_exp; ++i) {
-		int64_t xi = m->rows[i].xi;
-		int64_t pi = m->rows[i].pi;
-		if (pi < m->rows[xi].p || pi >= m->rows[xi].p + m->rows[xi].len) {
-			fprintf(stderr, "FAIL: row[%d].pi=%ld not in run rows[%ld] = [%ld, %ld)\n",
-				i, (long)pi, (long)xi, (long)m->rows[xi].p,
-				(long)(m->rows[xi].p + m->rows[xi].len));
+		int64_t xi = m->xi[i];
+		int64_t pi = m->pi[i];
+		if (pi < m->p[xi] || pi >= m->p[xi] + m->len[xi]) {
+			fprintf(stderr, "FAIL: row[%d].pi=%ld not in run [%ld] = [%ld, %ld)\n",
+				i, (long)pi, (long)xi, (long)m->p[xi],
+				(long)(m->p[xi] + m->len[xi]));
 			ret = 1; goto done;
 		}
 	}
@@ -153,12 +152,12 @@ static int test_single_char(void)
 		fprintf(stderr, "FAIL: single_char n_runs = %ld, expected 1\n", (long)m->n_runs);
 		ret = 1; goto done;
 	}
-	if (m->rows[0].c != 1 || m->rows[0].len != 4 || m->rows[0].p != 0) {
+	if (m->c[0] != 1 || m->len[0] != 4 || m->p[0] != 0) {
 		fprintf(stderr, "FAIL: single_char row[0] mismatch\n");
 		ret = 1; goto done;
 	}
-	if (m->rows[0].xi != 0) {
-		fprintf(stderr, "FAIL: single_char xi = %ld, expected 0\n", (long)m->rows[0].xi);
+	if (m->xi[0] != 0) {
+		fprintf(stderr, "FAIL: single_char xi = %u, expected 0\n", m->xi[0]);
 		ret = 1; goto done;
 	}
 	fprintf(stderr, "test_single_char: PASS\n");
@@ -189,18 +188,18 @@ static int test_alternating(void)
 
 	/* Verify every run has length 1 */
 	for (i = 0; i < 6; ++i) {
-		if (m->rows[i].len != 1) {
+		if (m->len[i] != 1) {
 			fprintf(stderr, "FAIL: alternating row[%d].len = %ld, expected 1\n",
-				i, (long)m->rows[i].len);
+				i, (long)m->len[i]);
 			ret = 1; goto done;
 		}
 	}
 
 	/* Verify destination indices */
 	for (i = 0; i < 6; ++i) {
-		int64_t xi = m->rows[i].xi;
-		int64_t pi = m->rows[i].pi;
-		if (pi < m->rows[xi].p || pi >= m->rows[xi].p + m->rows[xi].len) {
+		int64_t xi = m->xi[i];
+		int64_t pi = m->pi[i];
+		if (pi < m->p[xi] || pi >= m->p[xi] + m->len[xi]) {
 			fprintf(stderr, "FAIL: alternating row[%d].pi=%ld not in run at xi=%ld\n",
 				i, (long)pi, (long)xi);
 			ret = 1; goto done;
@@ -210,9 +209,9 @@ static int test_alternating(void)
 	/* Verify LF-mapping against rank queries */
 	for (i = 0; i < 6; ++i) {
 		int64_t ok[RB3_ASIZE];
-		int c = rb3_fmi_rank1a(&fmi, m->rows[i].p, ok);
+		int c = rb3_fmi_rank1a(&fmi, m->p[i], ok);
 		int64_t pi = fmi.acc[c] + ok[c];
-		if (pi != m->rows[i].pi) {
+		if (pi != m->pi[i]) {
 			fprintf(stderr, "FAIL: alternating rank check failed for row[%d]\n", i);
 			ret = 1; goto done;
 		}
@@ -250,21 +249,21 @@ static int test_fmr_backend(void)
 	/* Verify LF-mapping and destination indices against rank queries */
 	for (i = 0; i < m->n_runs; ++i) {
 		int64_t ok[RB3_ASIZE];
-		int c = rb3_fmi_rank1a(&fmi, m->rows[i].p, ok);
+		int c = rb3_fmi_rank1a(&fmi, m->p[i], ok);
 		int64_t pi = fmi.acc[c] + ok[c];
-		int64_t xi = m->rows[i].xi;
+		int64_t xi = m->xi[i];
 
-		if (c != m->rows[i].c) {
-			fprintf(stderr, "FAIL: FMR row[%d] c=%d, rank says %d\n", i, m->rows[i].c, c);
+		if (c != m->c[i]) {
+			fprintf(stderr, "FAIL: FMR row[%d] c=%d, rank says %d\n", i, m->c[i], c);
 			ret = 1; goto done;
 		}
-		if (pi != m->rows[i].pi) {
+		if (pi != m->pi[i]) {
 			fprintf(stderr, "FAIL: FMR row[%d] pi=%ld, rank says %ld\n",
-				i, (long)m->rows[i].pi, (long)pi);
+				i, (long)m->pi[i], (long)pi);
 			ret = 1; goto done;
 		}
-		if (m->rows[i].pi < m->rows[xi].p ||
-		    m->rows[i].pi >= m->rows[xi].p + m->rows[xi].len) {
+		if (m->pi[i] < m->p[xi] ||
+		    m->pi[i] >= m->p[xi] + m->len[xi]) {
 			fprintf(stderr, "FAIL: FMR row[%d] xi check failed\n", i);
 			ret = 1; goto done;
 		}
@@ -305,8 +304,8 @@ static int test_lf_all_positions(void)
 		}
 		/* Verify run_idx is correct after LF */
 		if (run_idx < 0 || run_idx >= m->n_runs ||
-		    move_lf < m->rows[run_idx].p ||
-		    move_lf >= m->rows[run_idx].p + m->rows[run_idx].len) {
+		    move_lf < m->p[run_idx] ||
+		    move_lf >= m->p[run_idx] + m->len[run_idx]) {
 			fprintf(stderr, "FAIL: lf_all pos=%ld: returned run_idx=%ld doesn't contain lf=%ld\n",
 				(long)pos, (long)run_idx, (long)move_lf);
 			ret = 1; goto done;
@@ -451,9 +450,9 @@ static int test_reposition(void)
 					(long)i, c, (long)target);
 				ret = 1; goto done;
 			}
-			if (m->rows[target].c != c) {
+			if (m->c[target] != c) {
 				fprintf(stderr, "FAIL: reposition row=%ld c=%d -> row %ld has c=%d\n",
-					(long)i, c, (long)target, m->rows[target].c);
+					(long)i, c, (long)target, m->c[target]);
 				ret = 1; goto done;
 			}
 			/* Verify it's the nearest: no closer run of character c exists */
@@ -462,14 +461,14 @@ static int test_reposition(void)
 				int64_t j;
 				if (dist > 0) {
 					for (j = i + 1; j < target; j++)
-						if (m->rows[j].c == c) {
+						if (m->c[j] == c) {
 							fprintf(stderr, "FAIL: reposition row=%ld c=%d -> %ld but row %ld also has c=%d\n",
 								(long)i, c, (long)target, (long)j, c);
 							ret = 1; goto done;
 						}
 				} else if (dist < 0) {
 					for (j = i - 1; j > target; j--)
-						if (m->rows[j].c == c) {
+						if (m->c[j] == c) {
 							fprintf(stderr, "FAIL: reposition row=%ld c=%d -> %ld but row %ld also has c=%d (bwd)\n",
 								(long)i, c, (long)target, (long)j, c);
 							ret = 1; goto done;
@@ -522,8 +521,8 @@ static int test_move_step(void)
 			}
 			/* run_idx should contain new_pos */
 			if (run_idx < 0 || run_idx >= m->n_runs ||
-			    new_pos < m->rows[run_idx].p ||
-			    new_pos >= m->rows[run_idx].p + m->rows[run_idx].len) {
+			    new_pos < m->p[run_idx] ||
+			    new_pos >= m->p[run_idx] + m->len[run_idx]) {
 				fprintf(stderr, "FAIL: move_step pos=%ld c=%d -> run_idx=%ld doesn't contain %ld\n",
 					(long)pos, c, (long)run_idx, (long)new_pos);
 				ret = 1; goto done;
@@ -579,8 +578,8 @@ static int test_move_step_split(void)
 				ret = 1; goto done;
 			}
 			if (run_idx < 0 || run_idx >= m->n_runs ||
-			    new_pos < m->rows[run_idx].p ||
-			    new_pos >= m->rows[run_idx].p + m->rows[run_idx].len) {
+			    new_pos < m->p[run_idx] ||
+			    new_pos >= m->p[run_idx] + m->len[run_idx]) {
 				fprintf(stderr, "FAIL: step_split run_idx invalid\n");
 				ret = 1; goto done;
 			}
@@ -688,15 +687,14 @@ static int test_save_load(void)
 		}
 	}
 
-	/* Compare every row */
+	/* Compare every row's fields */
 	for (i = 0; i < m->n_runs; i++) {
-		rb3_move_row_t *a = &m->rows[i], *b = &m2->rows[i];
-		if (a->c != b->c || a->len != b->len || a->p != b->p ||
-		    a->pi != b->pi || a->xi != b->xi) {
+		if (m->c[i] != m2->c[i] || m->len[i] != m2->len[i] || m->p[i] != m2->p[i] ||
+		    m->pi[i] != m2->pi[i] || m->xi[i] != m2->xi[i]) {
 			fprintf(stderr, "FAIL: save_load row[%d] field mismatch\n", i);
 			ret = 1; goto done2;
 		}
-		if (memcmp(a->dist, b->dist, sizeof(a->dist)) != 0) {
+		if (memcmp(&m->dist[i * RB3_ASIZE], &m2->dist[i * RB3_ASIZE], RB3_ASIZE * sizeof(int16_t)) != 0) {
 			fprintf(stderr, "FAIL: save_load row[%d] dist mismatch\n", i);
 			ret = 1; goto done2;
 		}
@@ -762,9 +760,10 @@ static int test_save_load_split(void)
 		ret = 1; goto done2;
 	}
 
-	/* Compare all rows byte-by-byte */
+	/* Compare all row fields */
 	for (i = 0; i < m->n_runs; i++) {
-		if (memcmp(&m->rows[i], &m2->rows[i], sizeof(rb3_move_row_t)) != 0) {
+		if (m->c[i] != m2->c[i] || m->len[i] != m2->len[i] || m->p[i] != m2->p[i] ||
+		    m->pi[i] != m2->pi[i] || m->xi[i] != m2->xi[i]) {
 			fprintf(stderr, "FAIL: save_load_split row[%d] mismatch\n", i);
 			ret = 1; goto done2;
 		}
@@ -1507,9 +1506,9 @@ static int test_bmove_init(void)
 		ret = 1; goto done;
 	}
 
-	/* Verify cumrank: total should equal acc counts */
+	/* Verify sampled cumrank: final totals should equal acc counts */
 	for (c = 0; c < RB3_ASIZE; c++) {
-		int64_t total = bm->cumrank[m->n_runs * RB3_ASIZE + c];
+		int64_t total = bm->cumrank[bm->n_samples * RB3_ASIZE + c];
 		int64_t expected = m->acc[c + 1] - m->acc[c];
 		if (total != expected) {
 			fprintf(stderr, "FAIL: bmove_init cumrank total[%d] = %ld, expected %ld\n",
@@ -1518,9 +1517,9 @@ static int test_bmove_init(void)
 		}
 	}
 
-	/* Verify cumrank is monotonically non-decreasing for each character */
+	/* Verify sampled cumrank is monotonically non-decreasing for each character */
 	for (c = 0; c < RB3_ASIZE; c++) {
-		for (i = 1; i <= m->n_runs; i++) {
+		for (i = 1; i <= (int64_t)bm->n_samples; i++) {
 			if (bm->cumrank[i * RB3_ASIZE + c] < bm->cumrank[(i - 1) * RB3_ASIZE + c]) {
 				fprintf(stderr, "FAIL: bmove_init cumrank[%ld][%d] not monotonic\n", (long)i, c);
 				ret = 1; goto done;
@@ -1571,7 +1570,7 @@ static int test_count_intervals(void)
 		for (j = 0; j < m->n_runs; j++) {
 			for (c2 = 0; c2 < RB3_ASIZE; c2++)
 				cumrank[(j + 1) * RB3_ASIZE + c2] = cumrank[j * RB3_ASIZE + c2];
-			cumrank[(j + 1) * RB3_ASIZE + m->rows[j].c] += m->rows[j].len;
+			cumrank[(j + 1) * RB3_ASIZE + m->c[j]] += m->len[j];
 		}
 
 		/* Test several multi-character patterns, verify intervals at each step */
@@ -1616,7 +1615,7 @@ static int test_count_intervals(void)
 									int64_t a = 0, b = m->n_runs - 1;
 									while (a < b) {
 										int64_t mid = a + (b - a + 1) / 2;
-										if (m->rows[mid].p <= move_lo) a = mid;
+										if (m->p[mid] <= move_lo) a = mid;
 										else b = mid - 1;
 									}
 									lo_run = a;
@@ -1625,22 +1624,22 @@ static int test_count_intervals(void)
 									int64_t a = 0, b = m->n_runs - 1;
 									while (a < b) {
 										int64_t mid = a + (b - a + 1) / 2;
-										if (m->rows[mid].p <= move_hi) a = mid;
+										if (m->p[mid] <= move_hi) a = mid;
 										else b = mid - 1;
 									}
 									hi_run = a;
 								} else hi_run = m->n_runs - 1;
 
 								rank_lo = cumrank[lo_run * RB3_ASIZE + c];
-								if (m->rows[lo_run].c == c)
-									rank_lo += move_lo - m->rows[lo_run].p;
+								if (m->c[lo_run] == c)
+									rank_lo += move_lo - m->p[lo_run];
 
 								if (move_hi >= m->bwt_len)
 									rank_hi = cumrank[m->n_runs * RB3_ASIZE + c];
 								else {
 									rank_hi = cumrank[hi_run * RB3_ASIZE + c];
-									if (m->rows[hi_run].c == c)
-										rank_hi += move_hi - m->rows[hi_run].p;
+									if (m->c[hi_run] == c)
+										rank_hi += move_hi - m->p[hi_run];
 								}
 
 								move_lo = m->acc[c] + rank_lo;
