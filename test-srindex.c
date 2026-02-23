@@ -305,6 +305,103 @@ static int test_string(const char *name, const uint8_t *text, int64_t n, int32_t
 		}
 	}
 
+	/* 7. Verify serialization round-trip (dump + restore) */
+	{
+		const char *tmpfn = "/tmp/test_srindex_roundtrip.sri";
+		rb3_srindex_t *sr2;
+		int rt_errors = 0;
+
+		if (rb3_srindex_dump(sr, tmpfn) != 0) {
+			fprintf(stderr, "FAILED: dump returned error\n");
+			errors++;
+		} else {
+			sr2 = rb3_srindex_restore(tmpfn);
+			if (sr2 == 0) {
+				fprintf(stderr, "FAILED: restore returned NULL\n");
+				errors++;
+			} else {
+				/* Compare all fields */
+				if (sr2->n != sr->n) { fprintf(stderr, "  roundtrip: n mismatch\n"); rt_errors++; }
+				if (sr2->n_runs != sr->n_runs) { fprintf(stderr, "  roundtrip: n_runs mismatch\n"); rt_errors++; }
+				if (sr2->n_samples != sr->n_samples) { fprintf(stderr, "  roundtrip: n_samples mismatch\n"); rt_errors++; }
+				if (sr2->n_sub != sr->n_sub) { fprintf(stderr, "  roundtrip: n_sub mismatch\n"); rt_errors++; }
+				if (sr2->s != sr->s) { fprintf(stderr, "  roundtrip: s mismatch\n"); rt_errors++; }
+				if (sr2->m != sr->m) { fprintf(stderr, "  roundtrip: m mismatch\n"); rt_errors++; }
+
+				for (i = 0; i < sr->n_runs && rt_errors < 5; ++i) {
+					if (sr2->phi_sa[i] != sr->phi_sa[i]) {
+						fprintf(stderr, "  roundtrip: phi_sa[%lld] %lld != %lld\n",
+						        (long long)i, (long long)sr2->phi_sa[i], (long long)sr->phi_sa[i]);
+						rt_errors++;
+					}
+					if (sr2->phi_da[i] != sr->phi_da[i]) {
+						fprintf(stderr, "  roundtrip: phi_da[%lld] %lld != %lld\n",
+						        (long long)i, (long long)sr2->phi_da[i], (long long)sr->phi_da[i]);
+						rt_errors++;
+					}
+				}
+				for (i = 0; i < sr->n_samples && rt_errors < 5; ++i) {
+					if (sr2->run_pos[i] != sr->run_pos[i]) {
+						fprintf(stderr, "  roundtrip: run_pos[%lld] %lld != %lld\n",
+						        (long long)i, (long long)sr2->run_pos[i], (long long)sr->run_pos[i]);
+						rt_errors++;
+					}
+					if (sr2->run_sa[i] != sr->run_sa[i]) {
+						fprintf(stderr, "  roundtrip: run_sa[%lld] %lld != %lld\n",
+						        (long long)i, (long long)sr2->run_sa[i], (long long)sr->run_sa[i]);
+						rt_errors++;
+					}
+				}
+				if (!sr->sub_is_alias) {
+					for (i = 0; i < sr->n_sub && rt_errors < 5; ++i) {
+						if (sr2->sub_pos[i] != sr->sub_pos[i]) {
+							fprintf(stderr, "  roundtrip: sub_pos[%lld] %lld != %lld\n",
+							        (long long)i, (long long)sr2->sub_pos[i], (long long)sr->sub_pos[i]);
+							rt_errors++;
+						}
+						if (sr2->sub_sa[i] != sr->sub_sa[i]) {
+							fprintf(stderr, "  roundtrip: sub_sa[%lld] %lld != %lld\n",
+							        (long long)i, (long long)sr2->sub_sa[i], (long long)sr->sub_sa[i]);
+							rt_errors++;
+						}
+					}
+				}
+				/* Verify phi function on restored index */
+				for (i = 1; i < n && rt_errors < 5; ++i) {
+					int64_t phi_val = rb3_srindex_phi(sr2, sa[i]);
+					if (phi_val != sa[i-1]) {
+						fprintf(stderr, "  roundtrip phi(SA[%lld]=%lld) = %lld, expected %lld\n",
+						        (long long)i, (long long)sa[i], (long long)phi_val, (long long)sa[i-1]);
+						rt_errors++;
+					}
+				}
+				/* Verify locate_all on restored index */
+				{
+					int64_t *out2 = (int64_t*)malloc(n * sizeof(int64_t));
+					int64_t cnt2 = rb3_srindex_locate_all(sr2, &fmi, 0, n, out2, n);
+					if (cnt2 != n) {
+						fprintf(stderr, "  roundtrip locate_all returned %lld, expected %lld\n",
+						        (long long)cnt2, (long long)n);
+						rt_errors++;
+					} else {
+						for (i = 0; i < n && rt_errors < 5; ++i)
+							if (out2[i] != sa[i]) rt_errors++;
+					}
+					free(out2);
+				}
+
+				if (rt_errors) {
+					fprintf(stderr, "FAILED: serialization roundtrip had %d mismatches\n", rt_errors);
+					errors++;
+				} else {
+					printf("Serialization roundtrip: OK\n");
+				}
+				rb3_srindex_destroy(sr2);
+			}
+		}
+		remove(tmpfn);
+	}
+
 	rb3_srindex_destroy(sr);
 	rb3_fmi_free(&fmi);
 	free(sa); free(bwt);

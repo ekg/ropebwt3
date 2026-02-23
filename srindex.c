@@ -752,20 +752,229 @@ void rb3_srindex_destroy(rb3_srindex_t *sr)
  * SR-index serialization  *
  ***************************/
 
+/*
+ * V3 format: compressed SR-index with three optimizations:
+ *
+ * 1. 32-bit integer mode: For n < 2^32, sorted array samples and all
+ *    absolute values stored as uint32 instead of int64. Halves the index.
+ *
+ * 2. Delta-encoded sorted arrays (phi_sa, run_pos, sub_pos):
+ *    - Absolute sample every K entries (K = DELTA_SAMPLE_K)
+ *    - Between samples: 16-bit or 32-bit deltas (chosen per array)
+ *    - Provides O(log(count/K) + K) binary search via sample index
+ *
+ * 3. Bit-packed unsorted arrays (phi_da, run_sa, sub_sa):
+ *    - ceil(log2(n)) bits per entry packed into a byte array
+ *    - Access via (index * bits) >> 3 shift+mask
+ *
+ * Header (52 bytes):
+ *   magic "SRI\3"     4 bytes
+ *   s                  4 bytes (int32)
+ *   m                  8 bytes (int64)
+ *   n                  8 bytes (int64)
+ *   n_runs             8 bytes (int64)
+ *   n_samples          8 bytes (int64)
+ *   n_sub              8 bytes (int64) - 0 if s<=1 (alias)
+ *   bit_width          1 byte  - ceil(log2(n)) for bit-packing
+ *   delta_bits         1 byte  - 16 or 32 for delta encoding
+ *   reserved           2 bytes
+ *
+ * Array layout:
+ *   phi_sa     delta-encoded
+ *   phi_da     bit-packed
+ *   run_pos    delta-encoded
+ *   run_sa     bit-packed
+ *   sub_pos    delta-encoded (if not alias)
+ *   sub_sa     bit-packed (if not alias)
+ *   cum_len    raw int64 (small)
+ *   tosid      raw int64 (small)
+ */
+
+#define DELTA_SAMPLE_K 64
+
+/* Compute ceil(log2(n)), minimum 1 */
+static int compute_bit_width(int64_t n)
+{
+	int bits = 0;
+	int64_t v = n - 1;
+	if (v <= 0) return 1;
+	while (v > 0) { bits++; v >>= 1; }
+	return bits;
+}
+
+/* Check if any delta in a sorted array exceeds 16-bit range */
+static int need_32bit_deltas(const int64_t *arr, int64_t count)
+{
+	int64_t i;
+	for (i = 1; i < count; ++i)
+		if (arr[i] - arr[i-1] > 65535) return 1;
+	return 0;
+}
+
+/*
+ * Write a delta-encoded sorted array.
+ * Format: [n_samples uint32 absolute samples] [count deltas of delta_bits/8 bytes each]
+ * Sample at positions 0, K, 2K, ...
+ */
+static void write_delta_array(FILE *fp, const int64_t *arr, int64_t count,
+                               int delta_bits)
+{
+	int64_t i, n_samp;
+	if (count == 0) return;
+
+	/* Write absolute samples every K entries */
+	n_samp = (count + DELTA_SAMPLE_K - 1) / DELTA_SAMPLE_K;
+	for (i = 0; i < n_samp; ++i) {
+		uint32_t v = (uint32_t)arr[i * DELTA_SAMPLE_K];
+		fwrite(&v, 4, 1, fp);
+	}
+
+	/* Write deltas for all entries after the first */
+	if (delta_bits == 16) {
+		for (i = 1; i < count; ++i) {
+			uint16_t d = (uint16_t)(arr[i] - arr[i-1]);
+			fwrite(&d, 2, 1, fp);
+		}
+	} else {
+		for (i = 1; i < count; ++i) {
+			uint32_t d = (uint32_t)(arr[i] - arr[i-1]);
+			fwrite(&d, 4, 1, fp);
+		}
+	}
+}
+
+/*
+ * Read a delta-encoded sorted array back into int64_t.
+ */
+static void read_delta_array(FILE *fp, int64_t *arr, int64_t count,
+                              int delta_bits)
+{
+	int64_t i, n_samp;
+	uint32_t *samples;
+	if (count == 0) return;
+
+	n_samp = (count + DELTA_SAMPLE_K - 1) / DELTA_SAMPLE_K;
+	samples = RB3_MALLOC(uint32_t, n_samp);
+	fread(samples, 4, n_samp, fp);
+
+	/* Set sample positions */
+	for (i = 0; i < n_samp; ++i)
+		arr[i * DELTA_SAMPLE_K] = samples[i];
+	free(samples);
+
+	/* Read and accumulate deltas */
+	if (delta_bits == 16) {
+		for (i = 1; i < count; ++i) {
+			uint16_t d;
+			fread(&d, 2, 1, fp);
+			if (i % DELTA_SAMPLE_K != 0) /* don't overwrite samples */
+				arr[i] = arr[i-1] + d;
+		}
+	} else {
+		for (i = 1; i < count; ++i) {
+			uint32_t d;
+			fread(&d, 4, 1, fp);
+			if (i % DELTA_SAMPLE_K != 0)
+				arr[i] = arr[i-1] + d;
+		}
+	}
+}
+
+/*
+ * Write a bit-packed array. Each value uses 'bits' bits, packed into bytes.
+ * Total bytes: ceil(count * bits / 8)
+ */
+static void write_packed_array(FILE *fp, const int64_t *arr, int64_t count,
+                                int bits)
+{
+	int64_t i, n_bytes;
+	uint8_t *buf;
+	if (count == 0 || bits == 0) return;
+
+	n_bytes = ((int64_t)count * bits + 7) / 8;
+	buf = RB3_CALLOC(uint8_t, n_bytes);
+
+	for (i = 0; i < count; ++i) {
+		uint64_t val = (uint64_t)arr[i];
+		int64_t bit_pos = i * bits;
+		int64_t byte_pos = bit_pos >> 3;
+		int bit_off = (int)(bit_pos & 7);
+		int remaining = bits;
+
+		/* Write value across byte boundaries */
+		while (remaining > 0) {
+			int can_write = 8 - bit_off;
+			if (can_write > remaining) can_write = remaining;
+			buf[byte_pos] |= (uint8_t)((val & ((1U << can_write) - 1)) << bit_off);
+			val >>= can_write;
+			remaining -= can_write;
+			byte_pos++;
+			bit_off = 0;
+		}
+	}
+	fwrite(buf, 1, n_bytes, fp);
+	free(buf);
+}
+
+/*
+ * Read a bit-packed array back into int64_t.
+ */
+static void read_packed_array(FILE *fp, int64_t *arr, int64_t count,
+                               int bits)
+{
+	int64_t i, n_bytes;
+	uint8_t *buf;
+	if (count == 0 || bits == 0) return;
+
+	n_bytes = ((int64_t)count * bits + 7) / 8;
+	buf = RB3_MALLOC(uint8_t, n_bytes);
+	fread(buf, 1, n_bytes, fp);
+
+	for (i = 0; i < count; ++i) {
+		uint64_t val = 0;
+		int64_t bit_pos = i * bits;
+		int64_t byte_pos = bit_pos >> 3;
+		int bit_off = (int)(bit_pos & 7);
+		int remaining = bits;
+		int shift = 0;
+
+		while (remaining > 0) {
+			int can_read = 8 - bit_off;
+			if (can_read > remaining) can_read = remaining;
+			val |= (uint64_t)((buf[byte_pos] >> bit_off) & ((1U << can_read) - 1)) << shift;
+			shift += can_read;
+			remaining -= can_read;
+			byte_pos++;
+			bit_off = 0;
+		}
+		arr[i] = (int64_t)val;
+	}
+	free(buf);
+}
+
 int rb3_srindex_dump(const rb3_srindex_t *sr, const char *fn)
 {
 	FILE *fp;
 	int32_t y;
 	int64_t n_sub_disk;
+	int bit_width, delta_bits;
+	uint8_t hdr_extra[4];
+
 	if (sr == 0) return -1;
 	fp = fn && strcmp(fn, "-") ? fopen(fn, "wb") : fdopen(1, "wb");
 	if (fp == 0) return -1;
+
+	bit_width = compute_bit_width(sr->n);
+	delta_bits = (need_32bit_deltas(sr->phi_sa, sr->n_runs) ||
+	              need_32bit_deltas(sr->run_pos, sr->n_samples) ||
+	              (!sr->sub_is_alias && need_32bit_deltas(sr->sub_pos, sr->n_sub)))
+	             ? 32 : 16;
+
 	/*
-	 * Format version 2: for s<=1, n_sub is written as 0 on disk to indicate
-	 * that sub arrays are elided (they alias run arrays). On restore, n_sub=0
-	 * with s<=1 triggers reconstruction of the alias.
+	 * Format version 3: compressed with delta-encoding and bit-packing.
+	 * For s<=1, n_sub is written as 0 to indicate alias.
 	 */
-	fwrite("SRI\2", 1, 4, fp);
+	fwrite("SRI\3", 1, 4, fp);
 	y = sr->s; fwrite(&y, 4, 1, fp);
 	fwrite(&sr->m, 8, 1, fp);
 	fwrite(&sr->n, 8, 1, fp);
@@ -773,14 +982,36 @@ int rb3_srindex_dump(const rb3_srindex_t *sr, const char *fn)
 	fwrite(&sr->n_samples, 8, 1, fp);
 	n_sub_disk = sr->sub_is_alias ? 0 : sr->n_sub;
 	fwrite(&n_sub_disk, 8, 1, fp);
-	fwrite(sr->phi_sa, 8, sr->n_runs, fp);
-	fwrite(sr->phi_da, 8, sr->n_runs, fp);
-	fwrite(sr->run_pos, 8, sr->n_samples, fp);
-	fwrite(sr->run_sa, 8, sr->n_samples, fp);
-	if (!sr->sub_is_alias) {
-		fwrite(sr->sub_pos, 8, sr->n_sub, fp);
-		fwrite(sr->sub_sa, 8, sr->n_sub, fp);
+	hdr_extra[0] = (uint8_t)bit_width;
+	hdr_extra[1] = (uint8_t)delta_bits;
+	hdr_extra[2] = 0;
+	hdr_extra[3] = 0;
+	fwrite(hdr_extra, 1, 4, fp);
+
+	/* Sorted arrays: delta-encoded */
+	write_delta_array(fp, sr->phi_sa, sr->n_runs, delta_bits);
+	/* Unsorted: phi_da can contain -1, so we map -1 -> (1<<bw)-1 before packing.
+	 * Use bw+1 bits to avoid collision when n-1 == (1<<bw)-1. */
+	{
+		int64_t ii;
+		int phi_da_bits = bit_width + 1;
+		int64_t *phi_da_mapped = RB3_MALLOC(int64_t, sr->n_runs > 0 ? sr->n_runs : 1);
+		for (ii = 0; ii < sr->n_runs; ++ii)
+			phi_da_mapped[ii] = sr->phi_da[ii] < 0 ? ((1LL << phi_da_bits) - 1) : sr->phi_da[ii];
+		write_packed_array(fp, phi_da_mapped, sr->n_runs, phi_da_bits);
+		free(phi_da_mapped);
 	}
+	/* Sorted arrays: delta-encoded */
+	write_delta_array(fp, sr->run_pos, sr->n_samples, delta_bits);
+	/* Unsorted arrays: bit-packed */
+	write_packed_array(fp, sr->run_sa, sr->n_samples, bit_width);
+
+	if (!sr->sub_is_alias) {
+		write_delta_array(fp, sr->sub_pos, sr->n_sub, delta_bits);
+		write_packed_array(fp, sr->sub_sa, sr->n_sub, bit_width);
+	}
+
+	/* Small arrays: raw int64 */
 	fwrite(sr->cum_len, 8, sr->m + 1, fp);
 	fwrite(sr->text_order_sid, 8, sr->m, fp);
 	fclose(fp);
@@ -801,7 +1032,7 @@ rb3_srindex_t *rb3_srindex_restore(const char *fn)
 		return 0;
 	}
 	version = (unsigned char)magic[3];
-	if (version < 1 || version > 2) {
+	if (version < 1 || version > 3) {
 		fclose(fp);
 		return 0;
 	}
@@ -812,28 +1043,68 @@ rb3_srindex_t *rb3_srindex_restore(const char *fn)
 	fread(&sr->n_runs, 8, 1, fp);
 	fread(&sr->n_samples, 8, 1, fp);
 	fread(&sr->n_sub, 8, 1, fp);
-	sr->phi_sa = RB3_MALLOC(int64_t, sr->n_runs > 0 ? sr->n_runs : 1);
-	sr->phi_da = RB3_MALLOC(int64_t, sr->n_runs > 0 ? sr->n_runs : 1);
-	sr->run_pos = RB3_MALLOC(int64_t, sr->n_samples > 0 ? sr->n_samples : 1);
-	sr->run_sa = RB3_MALLOC(int64_t, sr->n_samples > 0 ? sr->n_samples : 1);
-	fread(sr->phi_sa, 8, sr->n_runs, fp);
-	fread(sr->phi_da, 8, sr->n_runs, fp);
-	fread(sr->run_pos, 8, sr->n_samples, fp);
-	fread(sr->run_sa, 8, sr->n_samples, fp);
 
-	if (version >= 2 && sr->n_sub == 0 && sr->s <= 1) {
-		/* v2 with s<=1: sub arrays were elided; alias run arrays */
-		sr->n_sub = sr->n_samples;
-		sr->sub_pos = sr->run_pos;
-		sr->sub_sa = sr->run_sa;
-		sr->sub_is_alias = 1;
+	if (version == 3) {
+		uint8_t hdr_extra[4];
+		int bit_width, delta_bits;
+
+		fread(hdr_extra, 1, 4, fp);
+		bit_width = hdr_extra[0];
+		delta_bits = hdr_extra[1];
+
+		sr->phi_sa = RB3_MALLOC(int64_t, sr->n_runs > 0 ? sr->n_runs : 1);
+		sr->phi_da = RB3_MALLOC(int64_t, sr->n_runs > 0 ? sr->n_runs : 1);
+		sr->run_pos = RB3_MALLOC(int64_t, sr->n_samples > 0 ? sr->n_samples : 1);
+		sr->run_sa = RB3_MALLOC(int64_t, sr->n_samples > 0 ? sr->n_samples : 1);
+
+		read_delta_array(fp, sr->phi_sa, sr->n_runs, delta_bits);
+		/* phi_da uses bit_width+1 bits; sentinel (all 1s) maps back to -1 */
+		{
+			int phi_da_bits = bit_width + 1;
+			int64_t sentinel = (1LL << phi_da_bits) - 1;
+			int64_t ii;
+			read_packed_array(fp, sr->phi_da, sr->n_runs, phi_da_bits);
+			for (ii = 0; ii < sr->n_runs; ++ii)
+				if (sr->phi_da[ii] == sentinel) sr->phi_da[ii] = -1;
+		}
+		read_delta_array(fp, sr->run_pos, sr->n_samples, delta_bits);
+		read_packed_array(fp, sr->run_sa, sr->n_samples, bit_width);
+
+		if (sr->n_sub == 0 && sr->s <= 1) {
+			sr->n_sub = sr->n_samples;
+			sr->sub_pos = sr->run_pos;
+			sr->sub_sa = sr->run_sa;
+			sr->sub_is_alias = 1;
+		} else {
+			sr->sub_pos = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
+			sr->sub_sa = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
+			read_delta_array(fp, sr->sub_pos, sr->n_sub, delta_bits);
+			read_packed_array(fp, sr->sub_sa, sr->n_sub, bit_width);
+			sr->sub_is_alias = 0;
+		}
 	} else {
-		/* v1 or v2 with s>1: sub arrays are on disk */
-		sr->sub_pos = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
-		sr->sub_sa = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
-		fread(sr->sub_pos, 8, sr->n_sub, fp);
-		fread(sr->sub_sa, 8, sr->n_sub, fp);
-		sr->sub_is_alias = 0;
+		/* v1/v2: raw int64 arrays */
+		sr->phi_sa = RB3_MALLOC(int64_t, sr->n_runs > 0 ? sr->n_runs : 1);
+		sr->phi_da = RB3_MALLOC(int64_t, sr->n_runs > 0 ? sr->n_runs : 1);
+		sr->run_pos = RB3_MALLOC(int64_t, sr->n_samples > 0 ? sr->n_samples : 1);
+		sr->run_sa = RB3_MALLOC(int64_t, sr->n_samples > 0 ? sr->n_samples : 1);
+		fread(sr->phi_sa, 8, sr->n_runs, fp);
+		fread(sr->phi_da, 8, sr->n_runs, fp);
+		fread(sr->run_pos, 8, sr->n_samples, fp);
+		fread(sr->run_sa, 8, sr->n_samples, fp);
+
+		if (version >= 2 && sr->n_sub == 0 && sr->s <= 1) {
+			sr->n_sub = sr->n_samples;
+			sr->sub_pos = sr->run_pos;
+			sr->sub_sa = sr->run_sa;
+			sr->sub_is_alias = 1;
+		} else {
+			sr->sub_pos = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
+			sr->sub_sa = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
+			fread(sr->sub_pos, 8, sr->n_sub, fp);
+			fread(sr->sub_sa, 8, sr->n_sub, fp);
+			sr->sub_is_alias = 0;
+		}
 	}
 
 	sr->cum_len = RB3_MALLOC(int64_t, sr->m + 1);
