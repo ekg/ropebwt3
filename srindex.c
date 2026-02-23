@@ -459,18 +459,28 @@ static void build_toehold(rb3_srindex_t *sr, const run_bounds_t *rb,
  * Subsampled SA building  *
  ***************************/
 
+/* Build bitvector marking sub_pos positions for O(1) lookup in locate_one */
+static void build_sub_bitvector(rb3_srindex_t *sr)
+{
+	int64_t i, n_words = (sr->n + 63) / 64;
+	sr->sub_bv = RB3_CALLOC(uint64_t, n_words > 0 ? n_words : 1);
+	for (i = 0; i < sr->n_sub; ++i) {
+		int64_t p = sr->sub_pos[i];
+		if (p >= 0 && p < sr->n)
+			sr->sub_bv[p >> 6] |= 1ULL << (p & 63);
+	}
+}
+
 static void build_subsampled(rb3_srindex_t *sr, int32_t s,
                              const pos_sa_pair_t *sub_pairs, int64_t n_sub)
 {
 	int64_t i;
 	if (s <= 1) {
-		/* For s=1, use run boundary samples as subsampled set */
+		/* For s=1, alias run boundary samples (no copy needed) */
 		sr->n_sub = sr->n_samples;
-		sr->sub_pos = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
-		sr->sub_sa = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
-		memcpy(sr->sub_pos, sr->run_pos, sr->n_sub * sizeof(int64_t));
-		memcpy(sr->sub_sa, sr->run_sa, sr->n_sub * sizeof(int64_t));
-		/* Sort by bwt_pos (run_pos is already sorted) */
+		sr->sub_pos = sr->run_pos;
+		sr->sub_sa = sr->run_sa;
+		sr->sub_is_alias = 1;
 	} else {
 		sr->n_sub = n_sub;
 		sr->sub_pos = RB3_MALLOC(int64_t, n_sub > 0 ? n_sub : 1);
@@ -479,7 +489,9 @@ static void build_subsampled(rb3_srindex_t *sr, int32_t s,
 			sr->sub_pos[i] = sub_pairs[i].bwt_pos;
 			sr->sub_sa[i] = sub_pairs[i].sa_val;
 		}
+		sr->sub_is_alias = 0;
 	}
+	build_sub_bitvector(sr);
 }
 
 /***************************
@@ -639,27 +651,25 @@ int64_t rb3_srindex_locate_one(const rb3_srindex_t *sr, const void *f_, int64_t 
 	 * SA[LF(pos)] = SA[pos] - 1, so after j steps SA = SA[bwt_pos] - j.
 	 * We stop when we find a stored sample. Return: stored_sa + steps. */
 	while (steps <= sr->s + sr->n) { /* safety bound */
-		/* Binary search for pos in sub_pos[] */
-		int64_t lo = 0, hi = sr->n_sub;
-		while (lo < hi) {
-			int64_t mid = lo + (hi - lo) / 2;
-			if (sr->sub_pos[mid] < pos) lo = mid + 1;
-			else hi = mid;
+		/* O(1) bitvector test + O(log n_sub) binary search only on hit */
+		if (sr->sub_bv && pos >= 0 && pos < sr->n &&
+		    (sr->sub_bv[pos >> 6] & (1ULL << (pos & 63)))) {
+			/* Confirmed in bitvector; binary search for exact SA value */
+			int64_t lo = 0, hi = sr->n_sub;
+			while (lo < hi) {
+				int64_t mid = lo + (hi - lo) / 2;
+				if (sr->sub_pos[mid] < pos) lo = mid + 1;
+				else hi = mid;
+			}
+			if (lo < sr->n_sub && sr->sub_pos[lo] == pos)
+				return sr->sub_sa[lo] + steps;
 		}
-		if (lo < sr->n_sub && sr->sub_pos[lo] == pos)
-			return sr->sub_sa[lo] + steps;
 
 		/* LF step */
 		c = rb3_fmi_rank1a(f, pos, ok);
 		pos = f->acc[c] + ok[c];
 		steps++;
 		if (c == 0) {
-			/* Hit a sentinel at BWT row pos (in [0, m)).
-			 * The position before the sentinel (at step steps-1) has per-string
-			 * SA = 0 (first character of string). With corrections:
-			 * SA[bwt_pos] = cum_len[pos] + (steps - 1).
-			 * We know pos is the sentinel's BWT row, and cum_len[pos] is the
-			 * correction for that sentinel's string. */
 			if (sr->cum_len && pos < sr->m)
 				return sr->cum_len[pos] + (steps - 1);
 			break;
@@ -728,8 +738,11 @@ void rb3_srindex_destroy(rb3_srindex_t *sr)
 	free(sr->phi_da);
 	free(sr->run_pos);
 	free(sr->run_sa);
-	free(sr->sub_pos);
-	free(sr->sub_sa);
+	if (!sr->sub_is_alias) {
+		free(sr->sub_pos);
+		free(sr->sub_sa);
+	}
+	free(sr->sub_bv);
 	free(sr->cum_len);
 	free(sr->text_order_sid);
 	free(sr);
@@ -743,22 +756,31 @@ int rb3_srindex_dump(const rb3_srindex_t *sr, const char *fn)
 {
 	FILE *fp;
 	int32_t y;
+	int64_t n_sub_disk;
 	if (sr == 0) return -1;
 	fp = fn && strcmp(fn, "-") ? fopen(fn, "wb") : fdopen(1, "wb");
 	if (fp == 0) return -1;
-	fwrite("SRI\1", 1, 4, fp);
+	/*
+	 * Format version 2: for s<=1, n_sub is written as 0 on disk to indicate
+	 * that sub arrays are elided (they alias run arrays). On restore, n_sub=0
+	 * with s<=1 triggers reconstruction of the alias.
+	 */
+	fwrite("SRI\2", 1, 4, fp);
 	y = sr->s; fwrite(&y, 4, 1, fp);
 	fwrite(&sr->m, 8, 1, fp);
 	fwrite(&sr->n, 8, 1, fp);
 	fwrite(&sr->n_runs, 8, 1, fp);
 	fwrite(&sr->n_samples, 8, 1, fp);
-	fwrite(&sr->n_sub, 8, 1, fp);
+	n_sub_disk = sr->sub_is_alias ? 0 : sr->n_sub;
+	fwrite(&n_sub_disk, 8, 1, fp);
 	fwrite(sr->phi_sa, 8, sr->n_runs, fp);
 	fwrite(sr->phi_da, 8, sr->n_runs, fp);
 	fwrite(sr->run_pos, 8, sr->n_samples, fp);
 	fwrite(sr->run_sa, 8, sr->n_samples, fp);
-	fwrite(sr->sub_pos, 8, sr->n_sub, fp);
-	fwrite(sr->sub_sa, 8, sr->n_sub, fp);
+	if (!sr->sub_is_alias) {
+		fwrite(sr->sub_pos, 8, sr->n_sub, fp);
+		fwrite(sr->sub_sa, 8, sr->n_sub, fp);
+	}
 	fwrite(sr->cum_len, 8, sr->m + 1, fp);
 	fwrite(sr->text_order_sid, 8, sr->m, fp);
 	fclose(fp);
@@ -768,13 +790,18 @@ int rb3_srindex_dump(const rb3_srindex_t *sr, const char *fn)
 rb3_srindex_t *rb3_srindex_restore(const char *fn)
 {
 	FILE *fp;
-	int32_t y;
+	int32_t y, version;
 	char magic[4];
 	rb3_srindex_t *sr;
 
 	fp = fn && strcmp(fn, "-") ? fopen(fn, "rb") : fdopen(0, "rb");
 	if (fp == 0) return 0;
-	if (fread(magic, 1, 4, fp) != 4 || strncmp(magic, "SRI\1", 4) != 0) {
+	if (fread(magic, 1, 4, fp) != 4 || magic[0] != 'S' || magic[1] != 'R' || magic[2] != 'I') {
+		fclose(fp);
+		return 0;
+	}
+	version = (unsigned char)magic[3];
+	if (version < 1 || version > 2) {
 		fclose(fp);
 		return 0;
 	}
@@ -789,19 +816,35 @@ rb3_srindex_t *rb3_srindex_restore(const char *fn)
 	sr->phi_da = RB3_MALLOC(int64_t, sr->n_runs > 0 ? sr->n_runs : 1);
 	sr->run_pos = RB3_MALLOC(int64_t, sr->n_samples > 0 ? sr->n_samples : 1);
 	sr->run_sa = RB3_MALLOC(int64_t, sr->n_samples > 0 ? sr->n_samples : 1);
-	sr->sub_pos = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
-	sr->sub_sa = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
-	sr->cum_len = RB3_MALLOC(int64_t, sr->m + 1);
-	sr->text_order_sid = RB3_MALLOC(int64_t, sr->m > 0 ? sr->m : 1);
 	fread(sr->phi_sa, 8, sr->n_runs, fp);
 	fread(sr->phi_da, 8, sr->n_runs, fp);
 	fread(sr->run_pos, 8, sr->n_samples, fp);
 	fread(sr->run_sa, 8, sr->n_samples, fp);
-	fread(sr->sub_pos, 8, sr->n_sub, fp);
-	fread(sr->sub_sa, 8, sr->n_sub, fp);
+
+	if (version >= 2 && sr->n_sub == 0 && sr->s <= 1) {
+		/* v2 with s<=1: sub arrays were elided; alias run arrays */
+		sr->n_sub = sr->n_samples;
+		sr->sub_pos = sr->run_pos;
+		sr->sub_sa = sr->run_sa;
+		sr->sub_is_alias = 1;
+	} else {
+		/* v1 or v2 with s>1: sub arrays are on disk */
+		sr->sub_pos = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
+		sr->sub_sa = RB3_MALLOC(int64_t, sr->n_sub > 0 ? sr->n_sub : 1);
+		fread(sr->sub_pos, 8, sr->n_sub, fp);
+		fread(sr->sub_sa, 8, sr->n_sub, fp);
+		sr->sub_is_alias = 0;
+	}
+
+	sr->cum_len = RB3_MALLOC(int64_t, sr->m + 1);
+	sr->text_order_sid = RB3_MALLOC(int64_t, sr->m > 0 ? sr->m : 1);
 	fread(sr->cum_len, 8, sr->m + 1, fp);
 	fread(sr->text_order_sid, 8, sr->m, fp);
 	fclose(fp);
+
+	/* Build bitvector for fast locate_one */
+	build_sub_bitvector(sr);
+
 	return sr;
 }
 

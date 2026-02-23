@@ -67,6 +67,14 @@ typedef struct {
 	int64_t *sub_pos;    /* BWT positions, sorted */
 	int64_t *sub_sa;     /* SA values at sub_pos positions */
 	/*
+	 * Bitvector for O(1) sub_pos membership test in locate_one.
+	 * sub_bv[i/64] has bit (i%64) set iff BWT position i is in sub_pos[].
+	 * Allocated during build/restore; size = ceil(n/64) * 8 bytes.
+	 * Much smaller and faster than binary searching sub_pos[].
+	 */
+	uint64_t *sub_bv;    /* bitvector, ceil(n/64) uint64_t words */
+	int32_t sub_is_alias; /* if true, sub_pos/sub_sa alias run_pos/run_sa (s=1) */
+	/*
 	 * Multi-string support: cumulative sequence lengths and text-order mapping.
 	 * For multi-string BWTs, SA values are absolute text positions.
 	 * cum_len[i] = start of the i-th sequence in text order.
