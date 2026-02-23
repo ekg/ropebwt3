@@ -225,8 +225,13 @@ static void sa_worker_func(void *data, long i, int tid)
 	else
 		max_sub = 0;
 
-	mt->per_sent_tgt[i] = RB3_MALLOC(pos_sa_pair_t,
-		mt->n_targets < 4096 ? mt->n_targets : 4096);
+	{
+		/* Each sentinel walks ~n/n_sent positions; estimate targets proportionally.
+		 * Use 4x the proportional estimate + slack, capped at n_targets. */
+		int64_t max_tgt = mt->n_targets / (mt->n_sent > 0 ? mt->n_sent : 1) * 4 + 1024;
+		if (max_tgt > mt->n_targets) max_tgt = mt->n_targets;
+		mt->per_sent_tgt[i] = RB3_MALLOC(pos_sa_pair_t, max_tgt);
+	}
 	if (max_sub > 0)
 		mt->per_sent_sub[i] = RB3_MALLOC(pos_sa_pair_t, max_sub);
 	else
